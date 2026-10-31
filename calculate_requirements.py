@@ -8,16 +8,22 @@ that a particular BOM/alternative has been released by engineering.
 from __future__ import annotations
 
 import math
+import os
 import re
+import tempfile
 from collections import defaultdict
 from contextlib import closing
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
+from zipfile import ZipFile
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.comments import Comment
+from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 ROOT = Path(__file__).resolve().parent
 BOM_FILE = ROOT / "bom(1).xlsx"
@@ -353,8 +359,8 @@ def build_data():
         total["priority_new"] += item["priority_new"]
 
     return {"old": old, "new": new, "start": start, "end": end,
-            "products": product_info, "versions": versions, "machine": machine,
-            "other": other, "totals": totals, "detail": detail}
+            "products": product_info, "versions": versions, "quantities": quantities,
+            "machine": machine, "other": other, "totals": totals, "detail": detail}
 
 
 NAVY = "183153"
@@ -415,19 +421,91 @@ def auto_filter(sheet):
     sheet.auto_filter.ref = f"A3:{get_column_letter(sheet.max_column)}{sheet.max_row}"
 
 
+def set_formula(sheet, coordinate, formula, cached_value, cache):
+    """Keep a real Excel formula and the already-validated starting result."""
+    if not formula.startswith("="):
+        raise ValueError(f"Not a formula: {formula!r}")
+    sheet[coordinate] = formula
+    cache[sheet.title][coordinate] = number(cached_value)
+
+
+def save_with_cached_values(workbook, output_path, cache):
+    """Save formulas plus numeric caches so viewers show values before recalculation.
+
+    openpyxl writes formulas but not their cached values. The caches supplied here
+    are computed from the same source records as the formulas. Excel recalculates
+    the formulas on open or on input changes; this does not replace any formula.
+    """
+    output_path = Path(output_path)
+    unknown = set(cache) - set(workbook.sheetnames)
+    if unknown:
+        raise ValueError(f"Unknown formula-cache sheets: {unknown}")
+    # Styled blank cells can be self-closing; never consume the next formula.
+    cell_pattern = re.compile(rb'(<c\b[^>]*\br="([A-Z]+[0-9]+)"[^>]*(?<!/)>)(.*?)(</c>)', re.DOTALL)
+    value_pattern = re.compile(rb'<v(?:\s*/>|\s*>.*?</v>)', re.DOTALL)
+    with tempfile.TemporaryDirectory(prefix=".formula-save-", dir=output_path.parent) as directory:
+        original = Path(directory) / "openpyxl.xlsx"
+        final = Path(directory) / "cached.xlsx"
+        workbook.save(original)
+        with ZipFile(original, "r") as source, ZipFile(final, "w") as destination:
+            for info in source.infolist():
+                payload = source.read(info.filename)
+                for index, sheet_name in enumerate(workbook.sheetnames, 1):
+                    if info.filename != f"xl/worksheets/sheet{index}.xml" or sheet_name not in cache:
+                        continue
+                    sheet_cache = cache[sheet_name]
+                    written = set()
+
+                    def replace_cell(match):
+                        coordinate = match.group(2).decode("ascii")
+                        if coordinate not in sheet_cache:
+                            return match.group(0)
+                        body = match.group(3)
+                        if not re.search(rb'<f(?:\s[^>]*)?>', body):
+                            raise ValueError(f"Cache points to non-formula cell {sheet_name}!{coordinate}")
+                        replacement = b"<v>" + str(sheet_cache[coordinate]).encode("ascii") + b"</v>"
+                        body, count = value_pattern.subn(replacement, body, count=1)
+                        if count != 1:
+                            raise ValueError(f"Missing value node in {sheet_name}!{coordinate}")
+                        written.add(coordinate)
+                        return match.group(1) + body + match.group(4)
+
+                    payload = cell_pattern.sub(replace_cell, payload)
+                    if written != set(sheet_cache):
+                        raise ValueError(f"Unwritten formula caches in {sheet_name}: {set(sheet_cache) - written}")
+                    break
+                destination.writestr(info, payload)
+        os.replace(final, output_path)
+
+
 def create_workbook(data):
     wb = Workbook()
+    cache = defaultdict(dict)
     sheet = wb.active
     sheet.title = "درخواست قطعات"
     headers = ["کد کالای مصرفی", "عنوان کالای مصرفی", "مقدار درخواست", "درخواست باز", "جایگزینی", "اولویت",
                "موجودی انبار پای کار", "موجودی انبار مواد اولیه", "نیاز برنامه سه‌روز", "نیاز برنامه بعدی",
-               "مانده پس از سه‌روز", "درخواست فقط برنامه بعدی", "درخواست با اولویت و موجودی جایگزین",
+               "مانده پس از سه‌روز", "درخواست فقط برنامه بعدی", "درخواست اولویت و جایگزین (ثابت)",
                "وضعیت موجودی پای کار", "واحد", "توضیحات", "برنامه تولید خود قطعه ۱۲ - قبل", "برنامه تولید خود قطعه ۱۲ - بعد"]
-    widths = [17, 46, 18, 15, 13, 14, 19, 20, 19, 19, 19, 21, 25, 25, 15, 43, 21, 21]
+    widths = [17, 46, 18, 15, 13, 14, 19, 20, 19, 19, 19, 21, 26, 25, 15, 43, 21, 21]
     machine, totals = data["machine"], data["totals"]
-    positive_count = sum(request_amount(t["old"] + t["new"], machine[c].quantity) > 0 for c, t in totals.items())
-    setup_table(sheet, f"برآورد درخواست قطعات | برنامه قبلی و برنامه بعدی | اقلام دارای درخواست: {positive_count}",
-                "فقط ردیف‌های BOM با پایان اعتبار خالی؛ برنامه قبلی مصرف‌نشده فرض شده و نسخه و جایگزین‌ها نیازمند تأییدند.", headers, widths)
+    plan_end = 3 + len(data["quantities"])
+    detail_end = 3 + len(data["detail"])
+    plan_codes = f"'ورودی برنامه'!$A$4:$A${plan_end}"
+    plan_boms = f"'ورودی برنامه'!$C$4:$C${plan_end}"
+    plan_old = f"'ورودی برنامه'!$D$4:$D${plan_end}"
+    plan_new = f"'ورودی برنامه'!$E$4:$E${plan_end}"
+    detail_codes = f"'جزئیات BOM'!$G$4:$G${detail_end}"
+    detail_old = f"'جزئیات BOM'!$S$4:$S${detail_end}"
+    detail_new = f"'جزئیات BOM'!$T$4:$T${detail_end}"
+    setup_table(sheet, "برآورد درخواست قطعات | برنامه قبلی و برنامه بعدی",
+                "فقط BOM با پایان اعتبار خالی؛ برنامه قبلی مصرف‌نشده فرض شده است. ستون C فرمول دارد و سناریوی M ثابت است.", headers, widths)
+    sheet["C3"].comment = Comment("فرمول: درخواست = ROUNDUP(MAX(0, نیاز سه‌روز + نیاز بعدی − موجودی پای کار), 0). گردکردن خطای شناوری قبل از ROUNDUP انجام می‌شود.", "راهنما")
+    sheet["I3"].comment = Comment("جمع نیاز این قطعه در همه محصولات از ستون S در صفحه جزئیات BOM با SUMIF.", "راهنما")
+    sheet["J3"].comment = Comment("جمع نیاز این قطعه در همه محصولات از ستون T در صفحه جزئیات BOM با SUMIF.", "راهنما")
+    sheet["M3"].comment = Comment("این سناریوی کمکی فقط مقدار اولیه ثابت است؛ با تغییر برنامه، ضریب یا موجودی به‌روز نمی‌شود. برای محاسبه مجدد باید فایل را دوباره تولید کرد.", "راهنما")
+    sheet["M3"].fill = PatternFill("solid", fgColor=PALE_YELLOW)
+    sheet["M3"].font = Font(name="Tahoma", size=10, bold=True, color="7A5100")
     sorted_codes = sorted(totals, key=lambda c: (-request_amount(totals[c]["old"] + totals[c]["new"], machine[c].quantity), c))
     for code in sorted_codes:
         t, st = totals[code], machine[code]
@@ -451,23 +529,58 @@ def create_workbook(data):
                         number(st.quantity - t["old"]), only_new, alternate, status, "، ".join(sorted(t["unit"])),
                         " | ".join(notes), number(plan["old"]) if plan else None, number(plan["new"]) if plan else None])
         row = sheet.max_row
-        if requested:
-            sheet.cell(row, 3).fill = PatternFill("solid", fgColor=PALE_RED)
-            sheet.cell(row, 3).font = Font(name="Tahoma", bold=True, size=10, color="9C1C1C")
+        set_formula(sheet, f"I{row}", f"=SUMIF({detail_codes},A{row},{detail_old})", t["old"], cache)
+        set_formula(sheet, f"J{row}", f"=SUMIF({detail_codes},A{row},{detail_new})", t["new"], cache)
+        # Remove floating-point noise before rounding the final shortage up.
+        set_formula(sheet, f"C{row}", f"=ROUNDUP(MAX(0,ROUND(I{row}+J{row}-G{row},10)),0)", requested, cache)
+        set_formula(sheet, f"K{row}", f"=ROUND(G{row}-I{row},10)", st.quantity - t["old"], cache)
+        set_formula(sheet, f"L{row}", f"=ROUNDUP(MAX(0,ROUND(J{row}-G{row},10)),0)", only_new, cache)
+        if plan:
+            set_formula(sheet, f"Q{row}", f"=SUMIF({plan_codes},A{row},{plan_old})", plan["old"], cache)
+            set_formula(sheet, f"R{row}", f"=SUMIF({plan_codes},A{row},{plan_new})", plan["new"], cache)
+        sheet.cell(row, 3).font = Font(name="Tahoma", bold=True, size=10, color=BLUE)
         if not st.saw_numeric:
             sheet.cell(row, 14).fill = PatternFill("solid", fgColor=PALE_YELLOW)
         if code.startswith("12"):
             sheet.cell(row, 16).fill = PatternFill("solid", fgColor=PALE_YELLOW)
         for col in (4, 8):
             sheet.cell(row, col).fill = PatternFill("solid", fgColor=GREY)
+    sheet.conditional_formatting.add(
+        f"C4:C{sheet.max_row}",
+        CellIsRule(operator="greaterThan", formula=["0"],
+                   fill=PatternFill("solid", fgColor=PALE_RED),
+                   font=Font(name="Tahoma", bold=True, color="9C1C1C")),
+    )
     auto_filter(sheet)
+
+    inputs = wb.create_sheet("ورودی برنامه")
+    input_headers = ["کد محصول", "نام محصول", "شماره BOM انتخاب‌شده", "تعداد برنامه سه‌روز", "تعداد برنامه بعدی", "شروع اعتبار", "تاریخ پایان اعتبار"]
+    setup_table(inputs, "ورودی برنامه به تفکیک محصول و BOM",
+                "برای آزمایش یا اصلاح محاسبه، فقط تعداد برنامه‌ها را در ستون‌های آبی ویرایش کنید. نسخه BOM به‌طور خودکار عوض نمی‌شود.",
+                input_headers, [17, 48, 25, 23, 23, 17, 20])
+    for (code, bom), quantities in sorted(data["quantities"].items()):
+        version = data["versions"][code][bom]
+        add_row(inputs, [excel_code(code), data["products"][code]["title"], bom,
+                         number(quantities["old"]), number(quantities["new"]),
+                         fmt_day(version.start), fmt_day(version.end) if version.end else None])
+        for col in (4, 5):
+            inputs.cell(inputs.max_row, col).fill = PatternFill("solid", fgColor=PALE_BLUE)
+    inputs["D3"].comment = Comment("تعداد باقیمانده از برنامه سه‌روز؛ با تغییر آن سناریوی اصلی با همان BOM باز حساب می‌شود.", "راهنما")
+    inputs["E3"].comment = Comment("تعداد برنامه بعدی؛ برای محاسبه جدید آن را در این صفحه ویرایش کنید.", "راهنما")
+    validation = DataValidation(type="decimal", operator="greaterThanOrEqual", formula1="0", allow_blank=False)
+    validation.showErrorMessage = True
+    validation.errorTitle = "مقدار نامعتبر"
+    validation.error = "تعداد برنامه باید عدد صفر یا بیشتر باشد."
+    inputs.add_data_validation(validation)
+    validation.add(f"D4:E{inputs.max_row}")
+    auto_filter(inputs)
 
     products = wb.create_sheet("برنامه محصولات ۱۲")
     p_headers = ["کد محصول", "نام محصول", "برنامه سه‌روز", "برنامه بعدی", "موجودی محصول در انبار پای کار ماشینی",
                  "موجودی محصول در سایر پای کارها (اطلاعاتی)", "جزئیات سایر انبارها", "نسخه BOM انتخاب‌شده",
                  "نسخه‌های همزمان با پایان اعتبار خالی", "شناسه پیش‌فرض ثبت‌شده", "هشدار"]
     setup_table(products, "کنترل محصولات برنامه‌ریزی‌شده با کد ۱۲",
-                "موجودی محصول نهایی صرفاً اطلاعاتی است و از تعداد برنامه تولید کم نشده است؛ مصرف BOM بر اساس تعداد برنامه است.",
+                "برنامه‌ها با فرمول از صفحه ورودی برنامه جمع می‌شوند. موجودی محصول نهایی اطلاعاتی است و از تعداد برنامه کم نشده است.",
                 p_headers, [17, 48, 17, 17, 22, 25, 65, 25, 40, 22, 45])
     for code, p in sorted(data["products"].items()):
         other_rows = data["other"].get(code, [])
@@ -484,18 +597,27 @@ def create_workbook(data):
                            " | ".join(f"{w}: {number(q):,}" for w, q in other_rows),
                            "، ".join(sorted(p["selected"])), "، ".join(sorted(p["candidates"])),
                            "، ".join(sorted(x for x in p["default_ids"] if x)) or "ثبت نشده", " | ".join(flags)])
+        row = products.max_row
+        set_formula(products, f"C{row}", f"=SUMIF({plan_codes},A{row},{plan_old})", p["old"], cache)
+        set_formula(products, f"D{row}", f"=SUMIF({plan_codes},A{row},{plan_new})", p["new"], cache)
         if flags:
-            products.cell(products.max_row, 11).fill = PatternFill("solid", fgColor=PALE_YELLOW)
+            products.cell(row, 11).fill = PatternFill("solid", fgColor=PALE_YELLOW)
     auto_filter(products)
 
     detail = wb.create_sheet("جزئیات BOM")
     d_headers = ["کد محصول", "نام محصول", "شماره BOM", "شروع اعتبار", "تاریخ پایان اعتبار", "ردیف فایل BOM", "کد قطعه",
                  "عنوان قطعه", "واحد", "ضریب", "مبنای BOM", "گروه جایگزین", "اولویت", "درصد استفاده BOM",
-                 "سهم اعمال شده", "روش محاسبه", "برنامه سه‌روز محصول", "برنامه بعدی محصول", "نیاز سه‌روز قطعه",
-                 "نیاز بعدی قطعه", "نیاز سه‌روز سناریوی اولویت", "نیاز بعدی سناریوی اولویت"]
-    setup_table(detail, "ریز محاسبه به تفکیک محصول و ردیف BOM",
-                "سناریوی اصلی نسبت‌های BOM را اعمال می‌کند؛ سناریوی اولویت از موجودی جایگزین‌ها استفاده می‌کند و نسبت‌ها را تضمین نمی‌کند.",
-                d_headers, [16, 45, 24, 16, 16, 15, 16, 48, 16, 14, 14, 15, 12, 16, 16, 29, 19, 19, 19, 19, 23, 23])
+                 "سهم اعمال شده (٪)", "روش محاسبه", "برنامه سه‌روز محصول", "برنامه بعدی محصول", "نیاز سه‌روز قطعه",
+                 "نیاز بعدی قطعه", "نیاز سه‌روز اولویت (ثابت)", "نیاز بعدی اولویت (ثابت)"]
+    setup_table(detail, "ریز فرمول محاسبه به تفکیک محصول و ردیف BOM",
+                "ستون‌های Q تا T فرمول دارند. ستون‌های U و V سناریوی جایگزین ثابت‌اند و بعد از تغییر ورودی به‌روز نمی‌شوند.",
+                d_headers, [16, 45, 24, 16, 16, 15, 16, 48, 16, 14, 14, 15, 12, 16, 19, 29, 19, 19, 19, 19, 23, 23])
+    detail["O3"].comment = Comment("برای قطعات عادی ۱۰۰٪ است. در گروه‌های درصدی از ستون N می‌آید؛ در گروه ۱۰۰٪/۱۰۰٪ سهم انتخاب‌شده ۱۰۰ یا صفر و ثابت است.", "راهنما")
+    detail["S3"].comment = Comment("نیاز سه‌روز = برنامه سه‌روز محصول × ضریب ÷ مبنای BOM × سهم اعمال‌شده ÷ ۱۰۰.", "راهنما")
+    detail["T3"].comment = Comment("نیاز برنامه بعدی = برنامه بعدی محصول × ضریب ÷ مبنای BOM × سهم اعمال‌شده ÷ ۱۰۰.", "راهنما")
+    for col in (21, 22):
+        detail.cell(3, col).fill = PatternFill("solid", fgColor=PALE_YELLOW)
+        detail.cell(3, col).font = Font(name="Tahoma", size=10, bold=True, color="7A5100")
     for item in sorted(data["detail"], key=lambda x: (x["line"].product, x["line"].bom, x["line"].source_row)):
         line, version = item["line"], item["version"]
         add_row(detail, [excel_code(line.product), data["products"][line.product]["title"], line.bom,
@@ -504,6 +626,13 @@ def create_workbook(data):
                          line.group or "-", line.priority, number(line.pct) if line.pct is not None else None,
                          number(item["share"] * 100), item["method"], number(item["product_old"]), number(item["product_new"]),
                          number(item["old"]), number(item["new"]), number(item["priority_old"]), number(item["priority_new"])])
+        row = detail.max_row
+        if item["method"] == "سهم درصد استفاده BOM":
+            set_formula(detail, f"O{row}", f"=N{row}", item["share"] * 100, cache)
+        set_formula(detail, f"Q{row}", f"=SUMIFS({plan_old},{plan_codes},A{row},{plan_boms},C{row})", item["product_old"], cache)
+        set_formula(detail, f"R{row}", f"=SUMIFS({plan_new},{plan_codes},A{row},{plan_boms},C{row})", item["product_new"], cache)
+        set_formula(detail, f"S{row}", f"=ROUND(Q{row}*J{row}/K{row}*O{row}/100,10)", item["old"], cache)
+        set_formula(detail, f"T{row}", f"=ROUND(R{row}*J{row}/K{row}*O{row}/100,10)", item["new"], cache)
     auto_filter(detail)
 
     guide = wb.create_sheet("راهنما و فرض‌ها")
@@ -521,22 +650,25 @@ def create_workbook(data):
     missing = sum(not machine[c].saw_numeric for c in totals)
     overlap = [c for c, p in data["products"].items() if len(p["candidates"]) > 1]
     lines = [
+        ("دیدن فرمول", "در اکسل روی عدد دلخواه در ستون «مقدار درخواست» یا روی سلول‌های نیاز در صفحه «جزئیات BOM» کلیک کنید؛ فرمول واقعی در نوار فرمول بالای صفحه نمایش داده می‌شود."),
+        ("ویرایش برنامه", "تعدادهای سه‌روز و بعدی در ستون‌های آبی صفحه «ورودی برنامه» قابل ویرایش‌اند. با تغییر آنها و محاسبه خودکار اکسل، نیاز هر محصول و جمع نیاز و درخواست اصلی به‌روز می‌شود. موجودی در ستون G صفحه درخواست نیز قابل ویرایش است."),
+        ("محدوده به‌روزرسانی", "فرمول‌ها فقط ردیف‌ها و BOMهای انتخاب‌شده در همین فایل را محاسبه می‌کنند. افزودن محصول، تغییر دوره یا انتخاب نسخه جدید BOM به بازتولید فایل نیاز دارد. اکسل را در حالت محاسبه خودکار نگه دارید."),
         ("ماهیت خروجی", "پیش‌نویس برآورد است، نه تأیید اجرای تولید، موجودی انبار مواد یا درخواست باز. در صفحه اول ستون‌های نمونه خروجی حفظ شده‌اند."),
         ("محصولات", "فقط کد محصول‌هایی که با ۱۲ شروع می‌شوند از برنامه‌ها انتخاب شده‌اند. کدهای خروجی، قطعات مصرفی BOM هستند و لزوماً با ۱۲ شروع نمی‌شوند."),
         ("دوره برنامه‌ها", f"برنامه سه‌روز از {fmt_day(min_old)} تا {fmt_day(max_old)}؛ برنامه بعدی از {fmt_day(data['start'])} تا {fmt_day(data['end'])}. ردیف‌های تکراری یک محصول جمع شده‌اند."),
-        ("فرمول اصلی", "مقدار درخواست = حداکثر صفر و حاصل گردکردن رو به بالای (نیاز قطعات برنامه سه‌روز + نیاز قطعات برنامه بعدی − موجودی پای کار ماشینی). گردکردن فقط در انتهای جمع هر قطعه انجام شده است."),
+        ("فرمول اصلی", "در صفحه درخواست، برای نمونه فرمول C4 برابر =ROUNDUP(MAX(0,ROUND(I4+J4-G4,10)),0) است: جمع نیاز سه‌روز و بعدی منهای موجودی، حداقل صفر و گرد به بالا. ROUND داخلی فقط خطای نمایش اعشار رایانه را حذف می‌کند."),
         ("هشدار مهم برنامه قبلی", "چون مقدار واقعی تولید/مصرف‌شده در فایل‌ها نیست، کل برنامه سه‌روز مصرف‌نشده و نیازمند رزرو فرض شده است. اگر بخشی قبلاً مصرف شده، این برآورد ممکن است بیش‌درخواست بدهد. ستون «درخواست فقط برنامه بعدی» سناریوی دیگر است؛ مقادیر دو ستون را با هم جمع نکنید."),
-        ("محاسبه نیاز", "تعداد برنامه هر محصول × ضریب قطعه ÷ مبنای BOM × سهم اعمال‌شده. جمع قطعه در همه محصولات در صفحه درخواست و جزئیات هر محصول در صفحه جزئیات BOM آمده است."),
+        ("محاسبه نیاز", "در صفحه جزئیات BOM برای هر ردیف، نیاز سه‌روز = برنامه محصول × ضریب ÷ مبنای BOM × سهم اعمال‌شده ÷ ۱۰۰ است؛ مثلاً S4 =ROUND(Q4*J4/K4*O4/100,10). ستون‌های I و J صفحه درخواست، نیاز همه محصولات را با SUMIF جمع می‌کنند."),
         ("نسخه BOM", "فقط ردیف‌هایی لحاظ شده‌اند که ستون «تاریخ پایان اعتبار» آنها خالی است؛ ردیف‌های دارای تاریخ پایان، حتی تاریخ آینده، حذف شده‌اند. از نسخه‌های باقی‌مانده که شروعشان تا تاریخ برنامه است، جدیدترین تاریخ شروع انتخاب شده است. شناسه هر نسخه برای تطبیق با شناسه پیش‌فرض موجود نیست؛ انتخاب پیش‌فرض قطعی نیست."),
         ("نسخه‌های همزمان", "برای محصولات " + ("، ".join(sorted(overlap)) if overlap else "هیچ‌کدام") + " چند نسخه با تاریخ پایان خالی و شروع معتبر همزمان وجود دارد. برای جلوگیری از دوباره‌شماری، فقط جدیدترین نسخه انتخاب شده؛ انتخاب باید توسط مهندسی تأیید شود."),
         ("قطعات جایگزین", "در گروه‌هایی که درصد استفاده جمعاً ۱۰۰ است، سهم هر قطعه مطابق درصد BOM فرض شده است. اگر هر دو جایگزین ۱۰۰٪ دارند، فقط اولویت اول برای سناریوی اصلی منظور شده تا مصرف دوبرابر نشود. این فرض و مجاز بودن نسبت‌ها باید تأیید شود."),
-        ("سناریوی دیگر جایگزین", "ستون «درخواست با اولویت و موجودی جایگزین» یک سناریوی جداست: ابتدا مصرف مستقیم رزرو می‌شود و سپس موجودی جایگزین‌ها به ترتیب اولویت استفاده می‌شود؛ باقیمانده روی اولویت اول قرار می‌گیرد. این روش تقریبی است، درصدهای BOM را الزاماً رعایت نمی‌کند و بدون تأیید فنی نباید جایگزین ستون اصلی شود."),
+        ("سناریوی دیگر جایگزین", "ستون M صفحه درخواست و ستون‌های U و V جزئیات BOM مقادیر اولیه ثابت هستند، نه فرمول. با تغییر برنامه، ضریب یا موجودی به‌روز نمی‌شوند و برای محاسبه مجدد آنها باید فایل را دوباره تولید کرد. این سناریوی تقریبی، موجودی جایگزین‌ها را بر اساس اولویت استفاده می‌کند و لزوماً درصدهای BOM را رعایت نمی‌کند."),
         ("پای کار", "فقط انبار پای کار مونتاژ ماشینی - جاده مخصوص محاسبه شده است؛ انبار پای کار در BOMهای انتخابی کد ۵۰ است. سایر انبارها برای درخواست قابل برداشت فرض نشده‌اند."),
         ("سلول موجودی خالی", f"برای {missing} کد، موجودی انبار پای کار در فایل خالی یا بدون ردیف بود؛ موقتاً صفر فرض شده و وضعیت هر ردیف مشخص است. خالی بودن لزوماً به معنای صفر واقعی نیست."),
         ("زمان موجودی", "زمان ایجاد فایل موجودی 2026-10-27 است؛ زمان دقیق ثبت خود موجودی در داده‌ها مشخص نیست. اگر مصرف برنامه قبلی پیش از ثبت موجودی انجام شده باشد، جمع کامل برنامه قبلی دوباره‌شماری ایجاد می‌کند."),
         ("درخواست باز / انبار مواد", "فایل‌های فعلی درخواست باز یا موجودی جاری انبار مواد اولیه را ندارند؛ ستون‌های مربوط عمداً خالی‌اند و از نمونه خروجی قدیمی به‌جای داده جاری استفاده نشده است."),
         ("زیرمجموعه‌های ۱۲", "قطعه‌های ۱۲ که در BOM محصول دیگری مصرف می‌شوند در خروجی آمده‌اند. تولید برنامه‌ریزی‌شده همان قطعه از درخواستش کم نشده، چون مقدار و زمان تکمیل واقعی معلوم نیست؛ قبل از درخواست انتقال یا خرید بررسی شود. BOM به‌صورت بازگشتی منفجر نشده تا برنامه مستقل زیرمجموعه دوباره‌شماری نشود."),
-        ("سایر فرض‌ها", "ضایعات، درخواست‌های باز، بسته‌بندی، حداقل سفارش و تأمین از انبارهای دیگر در محاسبه لحاظ نشده‌اند. اعداد در فایل ثابت و محاسبه‌شده‌اند و با تغییر فایل‌های منبع خودکار به‌روزرسانی نمی‌شوند."),
+        ("سایر فرض‌ها", "ضایعات، درخواست‌های باز، بسته‌بندی، حداقل سفارش و تأمین از انبارهای دیگر لحاظ نشده‌اند. تغییر فایل‌های منبع خارج از این کتاب‌کار خودکار وارد نمی‌شود؛ برای بارگذاری داده‌های جدید، فایل باید دوباره تولید شود."),
         ("منابع", "bom(1).xlsx | برنامه 3روز.xlsx | برنامه بعدی.xlsx | موجودی به تفکیک انبار (1).xlsx؛ خروجی.xlsx فقط نمونه قالب است."),
     ]
     for index, (label, text) in enumerate(lines, 2):
@@ -549,14 +681,16 @@ def create_workbook(data):
             cell.border = BORDER
         guide.row_dimensions[index].height = 58 if len(text) > 180 else 42
     guide.freeze_panes = "B2"
+    wb.calculation.calcMode = "auto"
     wb.calculation.fullCalcOnLoad = True
-    return wb
+    wb.calculation.forceFullCalc = True
+    return wb, cache
 
 
 def main():
     data = build_data()
-    wb = create_workbook(data)
-    wb.save(OUTPUT_FILE)
+    wb, cache = create_workbook(data)
+    save_with_cached_values(wb, OUTPUT_FILE, cache)
     positive = sum(request_amount(t["old"] + t["new"], data["machine"][c].quantity) > 0 for c, t in data["totals"].items())
     blank = sum(not data["machine"][c].saw_numeric for c in data["totals"])
     print(f"Saved: {OUTPUT_FILE}")
